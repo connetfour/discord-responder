@@ -1,7 +1,7 @@
 # language: Python 3.12, file: main.py, target: Railway
-# Raw Discord gateway selfbot. No discord.py — aiohttp only.
-# Two independent accounts, Gemini support triage, inline reference reply,
-# 40s auto-delete, 3-minute per-user cooldown, staff skip.
+# Single-account raw Discord gateway selfbot. aiohttp only.
+# GET /status to inspect connection state. TEST_CHANNEL_ID bypasses the
+# classifier for isolation testing.
 
 import asyncio
 import json
@@ -14,15 +14,15 @@ from collections import deque
 import aiohttp
 from aiohttp import WSMsgType, web
 
-# ================================================================ tokens
-TOKENS = [
-    os.environ.get("DISCORD_TOKEN_1", "MTUzOTEyMjc4NDk5MzU0MjIwNQ.GNAi4X.Q5oLJdJpMoTBM9Q1HkIYFcykuDFvpj4KlZbGC0"),
-    os.environ.get("DISCORD_TOKEN_2", "MTUzOTEyNDExNzk1MjAwNDA5OA.GiQoKK.znY4Azturay9LA2jK24UP3K7WS3LmuW0Rp51z0"),
-]
+# ================================================================ config
+TOKEN = os.environ.get("DISCORD_TOKEN", "MTUzOTEyMjc4NDk5MzU0MjIwNQ.GNAi4X.Q5oLJdJpMoTBM9Q1HkIYFcykuDFvpj4KlZbGC0")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6LHRN9tiow-4cGyIBNTV4oWt2iSqLEYdH4E9-X143zUog")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+
+TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "1562221992885755921").strip()
+VERBOSE = os.environ.get("VERBOSE", "1") == "1"
 
 API = "https://discord.com/api/v9"
 GATEWAY = "wss://gateway.discord.gg/?v=9&encoding=json"
@@ -35,6 +35,20 @@ COOLDOWN_SECONDS = 180
 PER_ACCOUNT_PER_MINUTE = 6
 PORT = int(os.environ.get("PORT", 8080))
 LOG_FILE = "activity.log"
+
+STATUS = {
+    "connected_as": None,
+    "self_id": None,
+    "guilds": [],
+    "gateway_ready": False,
+    "messages_seen": 0,
+    "guilds_missing": 0,
+    "ai_calls": 0,
+    "ai_yes": 0,
+    "replies_sent": 0,
+    "last_error": None,
+    "last_message": None,
+}
 
 SYSTEM_PROMPT = """You triage Discord messages for a server support team.
 Decide whether the author needs help and expects a reply.
@@ -94,11 +108,10 @@ _SEEN_MAX = 5000
 
 
 def log(line: str) -> None:
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(line, flush=True)
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as fh:
-            fh.write(f"[{stamp}] {line}\n")
+            fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {line}\n")
     except OSError:
         pass
 
@@ -142,12 +155,14 @@ def claim(message_id: int) -> bool:
 
 
 async def classify(http: aiohttp.ClientSession, text: str) -> bool:
-    if not GEMINI_API_KEY or GEMINI_API_KEY.startswith("PASTE_"):
+    if not GEMINI_API_KEY:
+        log("[!] no GEMINI_API_KEY — cannot classify")
         return False
+    STATUS["ai_calls"] += 1
     payload = {
         "model": GEMINI_MODEL,
         "temperature": 0,
-        "max_tokens": 8,
+        "max_tokens": 32,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": text[:600]},
@@ -157,27 +172,31 @@ async def classify(http: aiohttp.ClientSession, text: str) -> bool:
     for attempt in range(3):
         try:
             async with http.post(GEMINI_URL, json=payload, headers=headers,
-                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+                body = await r.text()
                 if r.status == 429:
-                    await asyncio.sleep(1.5 * (attempt + 1))
+                    await asyncio.sleep(2.0 * (attempt + 1))
                     continue
                 if r.status != 200:
-                    log(f"[!] gemini http {r.status}: {(await r.text())[:120]}")
+                    STATUS["last_error"] = f"gemini {r.status}: {body[:160]}"
+                    log(f"[!] gemini {r.status}: {body[:200]}")
                     return False
-                data = await r.json()
-                out = (data["choices"][0]["message"]["content"] or "").strip().upper()
-                return out.startswith("YES")
+                data = json.loads(body)
+                raw = (data["choices"][0]["message"]["content"] or "").strip()
+                verdict = raw.upper().startswith("YES")
+                if verdict:
+                    STATUS["ai_yes"] += 1
+                log(f"[ai] {raw[:40]!r} -> {'YES' if verdict else 'NO'}")
+                return verdict
         except Exception as exc:
+            STATUS["last_error"] = f"gemini error: {exc}"
             log(f"[!] gemini error: {exc}")
             await asyncio.sleep(1.0 * (attempt + 1))
     return False
 
 
 class Account:
-    """One Discord user account: gateway connection plus REST helpers."""
-
-    def __init__(self, index: int, token: str, http: aiohttp.ClientSession) -> None:
-        self.index = index + 1
+    def __init__(self, token: str, http: aiohttp.ClientSession) -> None:
         self.token = token
         self.http = http
         self.self_id: str | None = None
@@ -187,7 +206,7 @@ class Account:
         self.cooldowns: dict[str, float] = {}
         self.recent: deque[float] = deque()
 
-    # ---------------------------------------------------------- rest
+    # ------------------------------------------------------------ rest
     def headers(self) -> dict:
         return {"Authorization": self.token, "Content-Type": "application/json",
                 "User-Agent": UA}
@@ -197,7 +216,19 @@ class Account:
             self.recent.popleft()
         return len(self.recent) < PER_ACCOUNT_PER_MINUTE
 
-    async def send_reply(self, channel_id: str, guild_id: str, message_id: str) -> str | None:
+    async def fetch_guild(self, guild_id: str) -> None:
+        try:
+            async with self.http.get(f"{API}/guilds/{guild_id}",
+                                     headers=self.headers()) as r:
+                if r.status != 200:
+                    log(f"[!] fetch guild {guild_id} -> {r.status}")
+                    return
+                self._register_guild(await r.json())
+        except Exception as exc:
+            log(f"[!] fetch guild {guild_id} error: {exc}")
+
+    async def send_reply(self, channel_id: str, guild_id: str,
+                         message_id: str) -> str | None:
         body = {
             "content": REPLY_TEXT,
             "message_reference": {
@@ -212,16 +243,19 @@ class Account:
             try:
                 async with self.http.post(f"{API}/channels/{channel_id}/messages",
                                           json=body, headers=self.headers()) as r:
+                    text = await r.text()
                     if r.status == 429:
-                        wait = float((await r.json()).get("retry_after", 2))
+                        wait = float((json.loads(text)).get("retry_after", 2))
                         await asyncio.sleep(min(wait, 30))
                         continue
                     if r.status not in (200, 201):
-                        log(f"[!] acct{self.index} send {r.status}: {(await r.text())[:120]}")
+                        STATUS["last_error"] = f"send {r.status}: {text[:160]}"
+                        log(f"[!] send {r.status}: {text[:200]}")
                         return None
-                    return (await r.json())["id"]
+                    return json.loads(text)["id"]
             except Exception as exc:
-                log(f"[!] acct{self.index} send error: {exc}")
+                STATUS["last_error"] = f"send error: {exc}"
+                log(f"[!] send error: {exc}")
                 await asyncio.sleep(1.5 * (attempt + 1))
         return None
 
@@ -231,12 +265,11 @@ class Account:
             async with self.http.delete(
                 f"{API}/channels/{channel_id}/messages/{message_id}",
                 headers=self.headers()) as r:
-                if r.status not in (200, 204, 404):
-                    log(f"[!] acct{self.index} delete {r.status}")
+                log(f"[x] deleted {message_id} -> {r.status}")
         except Exception as exc:
-            log(f"[!] acct{self.index} delete error: {exc}")
+            log(f"[!] delete error: {exc}")
 
-    # ---------------------------------------------------------- gateway
+    # ------------------------------------------------------------ gateway
     async def run(self) -> None:
         backoff = 5
         while True:
@@ -246,16 +279,18 @@ class Account:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log(f"[!] account {self.index} dropped: {exc}; retry in {backoff}s")
+                STATUS["last_error"] = f"gateway: {exc}"
+                log(f"[!] gateway dropped: {exc}; retry in {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 300)
 
     async def _connect(self) -> None:
-        async with self.http.ws_connect(GATEWAY, max_msg_size=0,
-                                        heartbeat=None) as ws:
+        log("[..] connecting to gateway")
+        async with self.http.ws_connect(GATEWAY, max_msg_size=0) as ws:
             self.ws = ws
             hello = await ws.receive_json()
             interval = hello["d"]["heartbeat_interval"] / 1000.0
+            log(f"[..] hello, heartbeat every {interval:.1f}s")
             beat = asyncio.create_task(self._heartbeat(interval))
             await self._identify()
             try:
@@ -263,6 +298,7 @@ class Account:
                     if msg.type is WSMsgType.TEXT:
                         await self._dispatch(json.loads(msg.data))
                     elif msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
+                        log(f"[!] socket closed: {ws.exception()}")
                         break
             finally:
                 beat.cancel()
@@ -300,6 +336,7 @@ class Account:
                 "compress": False,
             },
         })
+        log("[..] identify sent")
 
     async def _dispatch(self, payload: dict) -> None:
         if payload.get("s") is not None:
@@ -309,20 +346,28 @@ class Account:
             await self.ws.send_json({"op": 1, "d": self.seq})
             return
         if op in (7, 9):
+            log(f"[!] gateway op {op} — reconnecting")
             await self.ws.close()
+            return
+        if op == 0 and payload.get("t") == "READY":
+            data = payload["d"]
+            self.self_id = data["user"]["id"]
+            STATUS["self_id"] = self.self_id
+            STATUS["connected_as"] = f"{data['user'].get('username')}#{data['user'].get('discriminator')}"
+            STATUS["gateway_ready"] = True
+            guilds = data.get("guilds", [])
+            log(f"[+] READY as {STATUS['connected_as']} — {len(guilds)} guilds")
+            await asyncio.gather(*(self.fetch_guild(g["id"]) for g in guilds),
+                                 return_exceptions=True)
+            STATUS["guilds"] = sorted(g["name"] for g in self.guilds.values())
+            log(f"[+] guilds loaded: {STATUS['guilds']}")
             return
         if op != 0:
             return
 
         event = payload.get("t")
         data = payload.get("d") or {}
-
-        if event == "READY":
-            self.self_id = data["user"]["id"]
-            guilds = data.get("guilds", [])
-            log(f"[+] account {self.index} online as "
-                f"{data['user']['username']} guilds={len(guilds)}")
-        elif event == "GUILD_CREATE":
+        if event == "GUILD_CREATE":
             self._register_guild(data)
         elif event == "MESSAGE_CREATE":
             await self._on_message(data)
@@ -338,79 +383,104 @@ class Account:
                             "name": data.get("name", "?")}
 
     async def _on_message(self, data: dict) -> None:
+        STATUS["messages_seen"] += 1
         guild_id = data.get("guild_id")
-        if not self.self_id or guild_id is None:
+        if guild_id is None:
             return
         author = data.get("author") or {}
         if author.get("id") == self.self_id or author.get("bot"):
             return
 
+        content = data.get("content") or ""
+        STATUS["last_message"] = f"{author.get('username')}: {content[:60]}"
+        if VERBOSE:
+            log(f"[.] {content[:80]!r} <{author.get('username')}>")
+
         guild = self.guilds.get(guild_id)
         if guild is None:
-            return
+            STATUS["guilds_missing"] += 1
+            log(f"[!] guild {guild_id} unknown — fetching now")
+            await self.fetch_guild(guild_id)
+            guild = self.guilds.get(guild_id)
+            if guild is None:
+                return
+
         if is_staff(guild_id, guild, data.get("member") or {}):
+            if VERBOSE:
+                log("[.] skip: staff member")
             return
 
-        content = data.get("content") or ""
-        if not worth_asking(content):
-            return
+        testing = bool(TEST_CHANNEL_ID) and data["channel_id"] == TEST_CHANNEL_ID
 
-        user_id = author.get("id")
-        now = time.monotonic()
-        last = self.cooldowns.get(user_id)
-        if last is not None and now - last < COOLDOWN_SECONDS:
-            return
-        if not self.rate_ok(now):
-            return
-        if not claim(int(data["id"])):
-            return
+        if not testing:
+            if not worth_asking(content):
+                if VERBOSE:
+                    log("[.] skip: prefilter")
+                return
+            uid = author.get("id")
+            now = time.monotonic()
+            last = self.cooldowns.get(uid)
+            if last is not None and now - last < COOLDOWN_SECONDS:
+                if VERBOSE:
+                    log("[.] skip: cooldown")
+                return
+            if not self.rate_ok(now):
+                return
+            if not claim(int(data["id"])):
+                return
+            if not await classify(self.http, content):
+                return
+            self.cooldowns[uid] = now
+            self.recent.append(now)
+        else:
+            log("[t] test channel — bypassing classifier")
 
-        if not await classify(self.http, content):
-            return
-
-        self.cooldowns[user_id] = now
-        self.recent.append(now)
         await asyncio.sleep(random.uniform(1.5, 4.0))
 
         channel_id = data["channel_id"]
         sent_id = await self.send_reply(channel_id, guild_id, data["id"])
         if not sent_id:
             return
-
-        channel_name = guild["channels"].get(channel_id, "?")
-        log(f"[>] acct{self.index} {author.get('username', '?')} "
-            f"#{channel_name}: {content[:70]!r}")
+        STATUS["replies_sent"] += 1
+        log(f"[>] replied to {author.get('username')} in "
+            f"#{guild['channels'].get(channel_id, '?')}")
         asyncio.create_task(self.delete_later(channel_id, sent_id))
 
 
-# ================================================================ keepalive
+# ================================================================ web
+ACCOUNT: Account | None = None
+
+
 async def _ping(request: web.Request) -> web.Response:
     return web.Response(text="alive")
+
+
+async def _status(request: web.Request) -> web.Response:
+    return web.json_response(STATUS)
 
 
 async def start_web() -> None:
     app = web.Application()
     app.router.add_get("/", _ping)
+    app.router.add_get("/status", _status)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log(f"[+] keepalive on 0.0.0.0:{PORT}")
+    log(f"[+] http on 0.0.0.0:{PORT}  (/ and /status)")
 
 
 async def main() -> None:
-    tokens = [t.strip() for t in TOKENS
-              if t and t.strip() and not t.strip().startswith("PASTE_TOKEN")]
-    if not tokens:
-        print("[!] no tokens configured")
+    global ACCOUNT
+    if not TOKEN or TOKEN.startswith("PASTE_"):
+        print("[!] DISCORD_TOKEN missing")
         return
-    if GEMINI_API_KEY.startswith("PASTE_"):
-        print("[!] no Gemini key — everything will classify NO")
+    if not GEMINI_API_KEY:
+        print("[!] GEMINI_API_KEY missing — only test-channel replies will work")
 
     async with aiohttp.ClientSession() as http:
         await start_web()
-        accounts = [Account(i, t, http) for i, t in enumerate(tokens)]
-        log(f"[+] starting {len(accounts)} account(s)")
-        await asyncio.gather(*(a.run() for a in accounts))
+        ACCOUNT = Account(TOKEN, http)
+        await ACCOUNT.run()
 
 
 if __name__ == "__main__":
