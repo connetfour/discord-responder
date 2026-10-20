@@ -19,7 +19,7 @@ TOKEN = os.environ.get("DISCORD_TOKEN", "MTUzOTEyMjc4NDk5MzU0MjIwNQ.GNAi4X.Q5oLJ
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6LHRN9tiow-4cGyIBNTV4oWt2iSqLEYdH4E9-X143zUog")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "1562221992885755921").strip()
 VERBOSE = os.environ.get("VERBOSE", "1") == "1"
@@ -162,7 +162,7 @@ async def classify(http: aiohttp.ClientSession, text: str) -> bool:
     payload = {
         "model": GEMINI_MODEL,
         "temperature": 0,
-        "max_tokens": 32,
+        "max_completion_tokens": 128,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": text[:600]},
