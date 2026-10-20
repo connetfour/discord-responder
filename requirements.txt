@@ -1,2 +1,1 @@
-discord.py-self>=2.0.0
 aiohttp>=3.10.0
