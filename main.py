@@ -15,9 +15,8 @@ import aiohttp
 from aiohttp import WSMsgType, web
 
 # ================================================================ config
-TOKEN = os.environ.get("DISCORD_TOKEN", "MTUzOTEyNDExNzk1MjAwNDA5OA.GWaLnd.gHX0Cyyfj2JMiX1P5hhl5-PZCumbc08v9wM4QM")
-
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6LHRN9tiow-4cGyIBNTV4oWt2iSqLEYdH4E9-X143zUog")
+TOKEN = os.environ.get("DISCORD_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
