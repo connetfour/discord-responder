@@ -270,19 +270,17 @@ class Account:
             log(f"[!] delete error: {exc}")
 
     # ------------------------------------------------------------ gateway
-    async def run(self) -> None:
-        backoff = 5
+        async def run(self) -> None:
         while True:
             try:
                 await self._connect()
-                backoff = 5
+                log("[!] socket ended — reconnecting in 5s")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 STATUS["last_error"] = f"gateway: {exc}"
-                log(f"[!] gateway dropped: {exc}; retry in {backoff}s")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 300)
+                log(f"[!] gateway error: {exc}")
+            await asyncio.sleep(5)
 
     async def _connect(self) -> None:
         log("[..] connecting to gateway")
@@ -290,7 +288,7 @@ class Account:
             self.ws = ws
             hello = await ws.receive_json()
             interval = hello["d"]["heartbeat_interval"] / 1000.0
-            log(f"[..] hello, heartbeat every {interval:.1f}s")
+            log(f"[!] socket closed: {ws.close_code} — {ws.exception()}")
             beat = asyncio.create_task(self._heartbeat(interval))
             await self._identify()
             try:
