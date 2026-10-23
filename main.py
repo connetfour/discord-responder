@@ -20,7 +20,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "1562221992885755921").strip()
+TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "1562221993326149725").strip()
 VERBOSE = os.environ.get("VERBOSE", "1") == "1"
 
 API = "https://discord.com/api/v9"
@@ -155,7 +155,7 @@ def claim(message_id: int) -> bool:
 
 async def classify(http: aiohttp.ClientSession, text: str) -> bool:
     if not GEMINI_API_KEY:
-        log("[!] no GEMINI_API_KEY — cannot classify")
+        log("[!] no GEMINI_API_KEY - cannot classify")
         return False
     STATUS["ai_calls"] += 1
     payload = {
@@ -269,11 +269,11 @@ class Account:
             log(f"[!] delete error: {exc}")
 
     # ------------------------------------------------------------ gateway
-        async def run(self) -> None:
+    async def run(self) -> None:
         while True:
             try:
                 await self._connect()
-                log("[!] socket ended — reconnecting in 5s")
+                log("[!] socket ended - reconnecting in 5s")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -287,18 +287,17 @@ class Account:
             self.ws = ws
             hello = await ws.receive_json()
             interval = hello["d"]["heartbeat_interval"] / 1000.0
-            log(f"[!] socket closed: {ws.close_code} — {ws.exception()}")
             beat = asyncio.create_task(self._heartbeat(interval))
             await self._identify()
             try:
                 async for msg in ws:
                     if msg.type is WSMsgType.TEXT:
                         await self._dispatch(json.loads(msg.data))
-                    elif msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
-                        log(f"[!] socket closed: {ws.exception()}")
+                    elif msg.type is WSMsgType.ERROR:
                         break
             finally:
                 beat.cancel()
+            log(f"[!] socket closed: {ws.close_code}")
 
     async def _heartbeat(self, interval: float) -> None:
         await asyncio.sleep(interval * random.random())
@@ -343,7 +342,7 @@ class Account:
             await self.ws.send_json({"op": 1, "d": self.seq})
             return
         if op in (7, 9):
-            log(f"[!] gateway op {op} — reconnecting")
+            log(f"[!] gateway op {op} - reconnecting")
             await self.ws.close()
             return
         if op == 0 and payload.get("t") == "READY":
@@ -353,7 +352,7 @@ class Account:
             STATUS["connected_as"] = f"{data['user'].get('username')}#{data['user'].get('discriminator')}"
             STATUS["gateway_ready"] = True
             guilds = data.get("guilds", [])
-            log(f"[+] READY as {STATUS['connected_as']} — {len(guilds)} guilds")
+            log(f"[+] READY as {STATUS['connected_as']} - {len(guilds)} guilds")
             await asyncio.gather(*(self.fetch_guild(g["id"]) for g in guilds),
                                  return_exceptions=True)
             STATUS["guilds"] = sorted(g["name"] for g in self.guilds.values())
@@ -396,7 +395,7 @@ class Account:
         guild = self.guilds.get(guild_id)
         if guild is None:
             STATUS["guilds_missing"] += 1
-            log(f"[!] guild {guild_id} unknown — fetching now")
+            log(f"[!] guild {guild_id} unknown - fetching now")
             await self.fetch_guild(guild_id)
             guild = self.guilds.get(guild_id)
             if guild is None:
@@ -430,7 +429,7 @@ class Account:
             self.cooldowns[uid] = now
             self.recent.append(now)
         else:
-            log("[t] test channel — bypassing classifier")
+            log("[t] test channel - bypassing classifier")
 
         await asyncio.sleep(random.uniform(1.5, 4.0))
 
@@ -472,7 +471,7 @@ async def main() -> None:
         print("[!] DISCORD_TOKEN missing")
         return
     if not GEMINI_API_KEY:
-        print("[!] GEMINI_API_KEY missing — only test-channel replies will work")
+        print("[!] GEMINI_API_KEY missing - only test-channel replies will work")
 
     async with aiohttp.ClientSession() as http:
         await start_web()
